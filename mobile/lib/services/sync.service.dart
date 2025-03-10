@@ -4,6 +4,7 @@ import 'package:collection/collection.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/domain/interfaces/exif.interface.dart';
 import 'package:immich_mobile/domain/interfaces/user.interface.dart';
+import 'package:immich_mobile/domain/interfaces/user_api.repository.dart';
 import 'package:immich_mobile/domain/models/store.model.dart';
 import 'package:immich_mobile/domain/models/user.model.dart';
 import 'package:immich_mobile/domain/services/store.service.dart';
@@ -16,6 +17,7 @@ import 'package:immich_mobile/interfaces/album_api.interface.dart';
 import 'package:immich_mobile/interfaces/album_media.interface.dart';
 import 'package:immich_mobile/interfaces/asset.interface.dart';
 import 'package:immich_mobile/interfaces/etag.interface.dart';
+import 'package:immich_mobile/interfaces/partner_api.interface.dart';
 import 'package:immich_mobile/providers/infrastructure/exif.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/store.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/user.provider.dart';
@@ -24,6 +26,7 @@ import 'package:immich_mobile/repositories/album_api.repository.dart';
 import 'package:immich_mobile/repositories/album_media.repository.dart';
 import 'package:immich_mobile/repositories/asset.repository.dart';
 import 'package:immich_mobile/repositories/etag.repository.dart';
+import 'package:immich_mobile/repositories/partner_api.repository.dart';
 import 'package:immich_mobile/services/entity.service.dart';
 import 'package:immich_mobile/services/hash.service.dart';
 import 'package:immich_mobile/utils/async_mutex.dart';
@@ -43,6 +46,8 @@ final syncServiceProvider = Provider(
     ref.watch(userRepositoryProvider),
     ref.watch(storeServiceProvider),
     ref.watch(etagRepositoryProvider),
+    ref.watch(partnerApiRepositoryProvider),
+    ref.watch(userApiRepositoryProvider),
   ),
 );
 
@@ -57,6 +62,8 @@ class SyncService {
   final IUserRepository _userRepository;
   final StoreService _storeService;
   final IETagRepository _eTagRepository;
+  final IPartnerApiRepository _partnerApiRepository;
+  final IUserApiRepository _userApiRepository;
   final AsyncMutex _lock = AsyncMutex();
   final Logger _log = Logger('SyncService');
 
@@ -71,6 +78,8 @@ class SyncService {
     this._userRepository,
     this._storeService,
     this._eTagRepository,
+    this._partnerApiRepository,
+    this._userApiRepository,
   );
 
   // public methods:
@@ -90,12 +99,11 @@ class SyncService {
     ) getChangedAssets,
     required FutureOr<List<Asset>?> Function(User user, DateTime until)
         loadAssets,
-    required FutureOr<List<User>?> Function() refreshUsers,
   }) =>
       _lock.run(
         () async =>
             await _syncRemoteAssetChanges(users, getChangedAssets) ??
-            await _syncRemoteAssetsFull(refreshUsers, loadAssets),
+            await _syncRemoteAssetsFull(getUsersFromServer, loadAssets),
       );
 
   /// Syncs remote albums to the database
@@ -841,6 +849,61 @@ class SyncService {
       _log.severe("Failed to remove all local albums and assets", e);
       return false;
     }
+  }
+
+  Future<List<User>?> getUsersFromServer() async {
+    List<User>? users;
+    try {
+      users = await _userApiRepository.getAll();
+    } catch (e) {
+      _log.warning("Failed to fetch users", e);
+      users = null;
+    }
+    final List<User> sharedBy =
+        await _partnerApiRepository.getAll(Direction.sharedByMe);
+    final List<User> sharedWith =
+        await _partnerApiRepository.getAll(Direction.sharedWithMe);
+
+    if (users == null) {
+      _log.warning("Failed to refresh users");
+      return null;
+    }
+
+    users.sortBy((u) => u.uid);
+    sharedBy.sortBy((u) => u.uid);
+    sharedWith.sortBy((u) => u.uid);
+
+    final updatedSharedBy = <User>[];
+
+    diffSortedListsSync(
+      users,
+      sharedBy,
+      compare: (User a, User b) => a.uid.compareTo(b.uid),
+      both: (User a, User b) {
+        updatedSharedBy.add(a.copyWith(isPartnerSharedBy: true));
+        return true;
+      },
+      onlyFirst: (User a) => updatedSharedBy.add(a),
+      onlySecond: (User b) => updatedSharedBy.add(b),
+    );
+
+    final updatedSharedWith = <User>[];
+
+    diffSortedListsSync(
+      updatedSharedBy,
+      sharedWith,
+      compare: (User a, User b) => a.uid.compareTo(b.uid),
+      both: (User a, User b) {
+        updatedSharedWith.add(
+          a.copyWith(inTimeline: b.inTimeline, isPartnerSharedWith: true),
+        );
+        return true;
+      },
+      onlyFirst: (User a) => updatedSharedWith.add(a),
+      onlySecond: (User b) => updatedSharedWith.add(b),
+    );
+
+    return updatedSharedWith;
   }
 }
 
